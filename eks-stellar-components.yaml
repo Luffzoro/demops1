@@ -1,0 +1,324 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  EKS cluster for running stellar workloads
+
+Parameters:
+  VPC:
+    Description: "ID of the VPC you are deploying ECS into"
+    Type: 'AWS::EC2::VPC::Id'
+    Default: ''
+  VPCCidr:
+    Description: CIDR of the VPC this stack is deployed to
+    Type: String
+  SubnetAz1ID:
+    Description: The ID of the private subnet in Availability Zone 1.
+    Type: 'AWS::EC2::Subnet::Id'
+  SubnetAz2ID:
+    Description: The ID of the private subnet in Availability Zone 2.
+    Type: 'AWS::EC2::Subnet::Id'
+  SubnetAz3ID:
+    Description: The ID of the private subnet in Availability Zone 3.
+    Type: 'AWS::EC2::Subnet::Id'
+  StellarSecurityGroup:
+    Description: Security group for Stellar components.
+    Type: 'AWS::EC2::SecurityGroup::Id'
+  JenkinsCidr:
+    Description: CIDR of Jenkins to allow SSH access from Jenkins to Magento backend node
+    Type: String
+    Default: 172.21.29.0/24
+
+  DBInstanceClass:
+    Description: 'The instance type of database server.'
+    Type: String
+    Default: 'db.t2.medium'
+    AllowedValues:
+      - db.m5.large
+      - db.m5.xlarge
+      - db.m5.2xlarge
+      - db.m5.4xlarge
+      - db.m5.12xlarge
+      - db.m5.24xlarge
+      - db.r5.large
+      - db.r5.xlarge
+      - db.r5.2xlarge
+      - db.r5.4xlarge
+      - db.r5.12xlarge
+      - db.r5.24xlarge
+      - db.r4.large
+      - db.r4.xlarge
+      - db.r4.2xlarge
+      - db.r4.4xlarge
+      - db.r4.8xlarge
+      - db.r4.16xlarge
+      - db.m4.large
+      - db.m4.xlarge
+      - db.m4.2xlarge
+      - db.m4.4xlarge
+      - db.m4.10xlarge
+      - db.m4.16xlarge
+      - db.t3.medium
+      - db.t3.large
+      - db.t3.xlarge
+      - db.t3.2xlarge
+      - db.t2.small
+      - db.t2.medium
+      - db.t2.large
+      - db.t2.xlarge
+      - db.t2.2xlarge
+  DBEngineVersion:
+    Description: 'MySQL version.'
+    Type: String
+    Default: '5.7.31'
+    AllowedValues:
+      - '8.0.21'
+      - '5.7.31'
+  RedisClusterName:
+    Description: Custom name for the Redis cluster. Auto generated if you don't supply your own.
+    Type: String
+    AllowedPattern: "^[a-zA-Z][-a-zA-Z0-9]*$"
+  RedisNodeType:
+    Description: Cache node instance class, e.g. cache.t2.micro(free tier). See https://docs.aws.amazon.com/AmazonElastiCache/latest/UserGuide/CacheNodes.SelectSize.html
+    Type: String
+    Default: cache.t2.medium
+    ConstraintDescription: Node instance class not supported
+    AllowedValues:
+      - cache.t2.micro
+      - cache.t2.small
+      - cache.t2.medium
+      - cache.m4.large
+      - cache.m4.xlarge
+      - cache.m4.2xlarge
+      - cache.m4.4xlarge
+      - cache.m4.10xlarge
+      - cache.r4.large
+      - cache.r4.xlarge
+      - cache.r4.2xlarge
+      - cache.r4.4xlarge
+      - cache.r4.8xlarge
+      - cache.r4.16xlarge
+
+  ElasticSearchNodeType:
+    Description: The node type to be provisioned for the Elasticsearch cluster
+    Type: String
+    Default: m4.large.elasticsearch
+    AllowedValues:
+      - t2.small.elasticsearch
+      - m4.large.elasticsearch
+      - m4.xlarge.elasticsearch
+      - c4.large.elasticsearch
+      - c4.xlarge.elasticsearch
+      - r4.large.elasticsearch
+      - r4.xlarge.elasticsearch
+  ElasticSearchClusterName:
+    Description: Custom name of the ElasticSearch cluster. Auto generated if you don't supply your own.
+    Type: String
+
+Mappings:
+  ServicePrincipalPartitionMap:
+    aws:
+      EC2: ec2.amazonaws.com
+      EKS: eks.amazonaws.com
+      EKSFargatePods: eks-fargate-pods.amazonaws.com
+    aws-cn:
+      EC2: ec2.amazonaws.com.cn
+      EKS: eks.amazonaws.com
+      EKSFargatePods: eks-fargate-pods.amazonaws.com
+    aws-us-gov:
+      EC2: ec2.amazonaws.com
+      EKS: eks.amazonaws.com
+      EKSFargatePods: eks-fargate-pods.amazonaws.com
+
+Resources:
+  ###############################################
+  # RDS Database
+  ###############################################
+
+  RDSSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: 'RDS credentials'
+      Name: !Sub "${AWS::StackName}-rds"
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "root"}'
+        GenerateStringKey: 'password'
+        PasswordLength: 16
+        ExcludeCharacters: "\"'`@/\\$#%&"
+
+  DBSubnetGroup:
+    Type: 'AWS::RDS::DBSubnetGroup'
+    Properties:
+      DBSubnetGroupDescription: !Ref 'AWS::StackName'
+      SubnetIds:
+        - !Ref SubnetAz1ID
+        - !Ref SubnetAz2ID
+        - !Ref SubnetAz3ID
+
+  DBInstance:
+    Type: AWS::RDS::DBInstance
+    DependsOn:
+      - RDSSecret
+    Properties:
+      AllowMajorVersionUpgrade: false
+      AutoMinorVersionUpgrade: true
+      DBInstanceClass: !Ref DBInstanceClass
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      Engine: mysql
+      EngineVersion: !Ref DBEngineVersion
+      MasterUsername: !Join ['', ['{{resolve:secretsmanager:', !Ref RDSSecret, ':SecretString:username}}' ]]
+      MasterUserPassword: !Join ['', ['{{resolve:secretsmanager:', !Ref RDSSecret, ':SecretString:password}}' ]]
+      AllocatedStorage: 20
+      MultiAZ: true
+      StorageType: gp3
+      StorageEncrypted: true
+      VPCSecurityGroups:
+        - !Ref StellarSecurityGroup
+
+  ###############################################
+  # Redis implementation on AWS::ElastiCache
+  ###############################################
+  SubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: Cache Subnet Group
+      SubnetIds:
+        - !Ref SubnetAz1ID
+        - !Ref SubnetAz2ID
+        - !Ref SubnetAz3ID
+
+  RedisCluster:
+    Type: AWS::ElastiCache::CacheCluster
+    Properties:
+      AutoMinorVersionUpgrade: false
+      Engine: redis
+      EngineVersion: 5.0.6
+      CacheNodeType: !Ref RedisNodeType
+      ClusterName : !Ref RedisClusterName
+      NumCacheNodes: 1
+      CacheSubnetGroupName: !Ref SubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref StellarSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-Redis"
+
+  ###############################################
+  # Elasticsearch implementation onAWS::Elasticsearch::Domain
+  # comes with icu and phonetic plugins prepackaged
+  ###############################################
+
+  ElasticsearchDomain:
+    Type: AWS::Elasticsearch::Domain
+    Properties:
+      DomainName: !Ref ElasticSearchClusterName
+      ElasticsearchClusterConfig:
+        DedicatedMasterEnabled: false
+        InstanceCount: 1
+        ZoneAwarenessEnabled: false
+        InstanceType: !Ref ElasticSearchNodeType
+      EBSOptions:
+        EBSEnabled: true
+        VolumeSize: 10
+        VolumeType: "gp3"
+      ElasticsearchVersion: 7.8
+      AccessPolicies:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: '*'
+            Action:
+              - 'es:ESHttp*'
+              - 'sts:AssumeRole'
+            Resource: !Sub 'arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${ElasticSearchClusterName}/*'
+      VPCOptions:
+        SecurityGroupIds:
+          - !Ref StellarSecurityGroup
+        SubnetIds:
+          - !Ref SubnetAz1ID
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}ElasticSearch"
+
+  ###############################################
+  # RabbitMQ with AWS::AmazonMQ::Broker
+  ###############################################
+  AmqpSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: 'RabbitMQ credentials'
+      Name: !Sub "${AWS::StackName}-amqp"
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "rabbit"}'
+        GenerateStringKey: 'password'
+        PasswordLength: 16
+        ExcludeCharacters: "=:,\"'`@/\\$#%&"
+
+  RabbitMQBroker:
+    Type: 'AWS::AmazonMQ::Broker'
+    DependsOn:
+      - AmqpSecret
+    Properties:
+      AutoMinorVersionUpgrade: false
+      BrokerName: !Sub "${AWS::StackName}-Broker"
+      DeploymentMode: SINGLE_INSTANCE
+      EngineType: RabbitMQ
+      EngineVersion: 3.8.6
+      HostInstanceType: mq.m5.large
+      Logs:
+        General: true
+      PubliclyAccessible: false
+      SecurityGroups:
+        - !Ref StellarSecurityGroup
+      SubnetIds:
+        - !Ref SubnetAz1ID
+      Users:
+        - Password: !Join ['', ['{{resolve:secretsmanager:', !Ref AmqpSecret, ':SecretString:password}}' ]]
+          Username: !Join ['', ['{{resolve:secretsmanager:', !Ref AmqpSecret, ':SecretString:username}}' ]]
+
+Outputs:
+  MysqlAddress:
+    Description: 'The connection endpoint for the database.'
+    Value: !GetAtt 'DBInstance.Endpoint.Address'
+    Export:
+      Name: !Sub '${AWS::StackName}-MysqlAddress'
+  RedisClusterArn:
+    Description: Redis Cluster Arn
+    Value: !Sub arn:aws:elasticache:${AWS::Region}:${AWS::AccountId}:cluster/${RedisCluster}
+    Export:
+      Name: !Sub ${AWS::StackName}-RedisClusterArn
+
+  RedisClusterId:
+    Description: Redis Cluster ID
+    Value: !Ref RedisCluster
+    Export:
+      Name: !Sub ${AWS::StackName}-RedisClusterID
+
+  RedisAddress:
+    Description: Redis endpoint address
+    Value: !GetAtt RedisCluster.RedisEndpoint.Address
+    Export:
+      Name: !Sub ${AWS::StackName}-RedisAddress
+
+  RedisPort:
+    Description: Redis port
+    Value: 6379
+    Export:
+      Name: !Sub ${AWS::StackName}-RedisPort
+
+  ElasticsearchAddress:
+    Description: "Elasticsearch endpont address"
+    Value: !GetAtt 'ElasticsearchDomain.DomainEndpoint'
+    Export:
+      Name: !Sub '${AWS::StackName}-ElasticsearchAddress'
+
+  ElasticsearchClusterArn:
+    Description: Elasticsearch Cluster Arn
+    Value: !GetAtt ElasticsearchDomain.DomainArn
+    Export:
+      Name: !Sub ${AWS::StackName}-ElasticsearchClusterArn
+
+  RabbitMqAddress:
+    Description: 'The connection endpoint for RabbitMQ.'
+    Value: !Join [ ',', !GetAtt 'RabbitMQBroker.AmqpEndpoints' ]
+    Export:
+      Name: !Sub '${AWS::StackName}-RabbitMqAddress'
