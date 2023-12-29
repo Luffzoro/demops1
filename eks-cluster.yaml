@@ -1,0 +1,435 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  EKS cluster for running stellar workloads
+
+Parameters:
+  EKSClusterName:
+    Type: String
+    Description: The desired name of your AWS EKS Cluster.
+  VPC:
+    Description: "ID of the VPC you are deploying ECS into"
+    Type: 'AWS::EC2::VPC::Id'
+    Default: ''
+  VPCCidr:
+    Description: CIDR of the VPC this stack is deployed to
+    Type: String
+  SubnetAz1ID:
+    Description: The ID of the private subnet in Availability Zone 1.
+    Type: 'AWS::EC2::Subnet::Id'
+  SubnetAz2ID:
+    Description: The ID of the private subnet in Availability Zone 2.
+    Type: 'AWS::EC2::Subnet::Id'
+  SubnetAz3ID:
+    Description: The ID of the private subnet in Availability Zone 3.
+    Type: 'AWS::EC2::Subnet::Id'
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an existing EC2 key pair to enable SSH access to the EC2 hosts
+  EC2AMI:
+    Description: AMI ID
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+  GitSshSecret:
+    Description: Secret name to containing SSH keypair for git
+    Type: String
+    Default: stellar/GitSshSecret
+  JenkinsCidr:
+    Description: CIDR of Jenkins to allow SSH access from Jenkins to Magento backend node
+    Type: String
+    Default: 172.21.29.0/24
+  BastionInstanceType:
+    Description: Instance Type For Bastion Instance
+    Type: String
+    Default: t3.medium
+    AllowedValues:
+      - t2.micro
+      - m1.small
+      - m1.large
+      - t3.large
+      - t3.medium
+  EKSVersion: 
+    Type: String
+    Default: 1.21
+  AwsAccountName:
+    Type: String
+    Description: AWS Account Name
+    Default: eprid212079-stellar-b2c-direct-st-dev
+  AwsAccountNumber:
+    Type: String
+    Description: AWS Account Number
+    Default: 143489396648
+  AWSSsmPolicy:
+    Type: String
+    Description: 'arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore'
+    Default: arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+  StellarSecurityGroupName:
+    Type: String
+    Description: Security Group Name For Stellar
+    Default: StellarSecurityGroup-QA-cluster-2
+
+Mappings:
+  ServicePrincipalPartitionMap:
+    aws:
+      EC2: ec2.amazonaws.com
+      EKS: eks.amazonaws.com
+      EKSFargatePods: eks-fargate-pods.amazonaws.com
+    aws-cn:
+      EC2: ec2.amazonaws.com.cn
+      EKS: eks.amazonaws.com
+      EKSFargatePods: eks-fargate-pods.amazonaws.com
+    aws-us-gov:
+      EC2: ec2.amazonaws.com
+      EKS: eks.amazonaws.com
+      EKSFargatePods: eks-fargate-pods.amazonaws.com
+
+Resources:
+
+  ###############################################
+  # Bastion Components
+  ###############################################
+  BastionSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${AWS::StackName}BastionSecurityGroup"
+      GroupDescription: Bastion Security Group
+      VpcId: !Ref 'VPC'
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 15.0.0.0/9
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 172.16.0.0/12
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 172.17.0.0/16
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref JenkinsCidr
+        - IpProtocol: icmp
+          FromPort: 8
+          ToPort: -1
+          CidrIp: 15.0.0.0/9
+        - IpProtocol: icmp
+          FromPort: 8
+          ToPort: -1
+          CidrIp: 172.16.0.0/12
+        - IpProtocol: icmp
+          FromPort: 8
+          ToPort: -1
+          CidrIp: 172.17.0.0/16
+
+  BastionEC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}BastionBastionEC2Role"
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ["ec2.amazonaws.com", "ssm.amazonaws.com"]
+            Action: ['sts:AssumeRole']
+      Path: /
+      ManagedPolicyArns:
+        - !Ref AWSSsmPolicy
+      Policies:
+        - PolicyName: BastionNodePolicy
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                  - 'secretsmanager:GetSecretValue'
+                  - 'secretsmanager:ListSecrets'
+                  - 'secretsmanager:CreateSecret'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - "eks:*"
+                Resource: "*"
+              - Effect: Allow
+                Action: ['iam:PassRole']
+                Resource: "*"
+                Condition:
+                  StringEquals: { "iam:PassedToService": "eks.amazonaws.com" }
+
+  BastionInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "${AWS::StackName}BastionInstanceProfile"
+      Path: /
+      Roles: [ !Ref BastionEC2Role ]
+
+  Bastion:
+    Type: AWS::EC2::Instance
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-bastion"
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 50
+            VolumeType: gp3
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: false
+          DeviceIndex: "0"
+          GroupSet: [!Ref 'BastionSecurityGroup']
+          SubnetId: !Ref SubnetAz1ID
+      KeyName: !Ref 'KeyName'
+      ImageId: !Ref 'EC2AMI'
+      InstanceType: !Ref BastionInstanceType
+      IamInstanceProfile: !Ref 'BastionInstanceProfile'
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          yum install -y aws-cfn-bootstrap jq awscli git python-pip
+          pip install boto3
+          mkdir -p ~/.ssh/
+          aws secretsmanager get-secret-value --secret-id ${GitSshSecret} \
+                                                                   --query SecretString \
+                                                                   --region ${AWS::Region} --output text | jq -r .PrivateKey | sed 's/\\n/\n/g' > ~/.ssh/id_rsa
+          chmod 400 ~/.ssh/id_rsa
+          aws secretsmanager get-secret-value --secret-id ${GitSshSecret} \
+                                                                   --query SecretString \
+                                                                   --region ${AWS::Region} --output text | jq -r .PublicKey | sed 's/\\n/\n/g' | tee -a /home/ec2-user/.ssh/authorized_keys
+          cp ~/.ssh/id_rsa /home/ec2-user/.ssh/id_rsa
+          chown ec2-user:ec2-user /home/ec2-user/.ssh/id_rsa
+
+          /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource Bastion --configsets LaunchConfig --region ${AWS::Region}
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource Bastion --region ${AWS::Region}
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          LaunchConfig:
+            - setup
+            - dns
+            - domain
+        setup:
+          files:
+            /etc/aws.env:
+              mode: '000744'
+              owner: root
+              group: root
+              content:
+                'Fn::Join':
+                  - "\n"
+                  - - ""
+                    - !Sub ["AWS_STACK_NAME=${StackName}", StackName: !Ref "AWS::StackName"]
+                    - !Sub ["AWS_REGION=${RegionName}", RegionName: !Ref "AWS::Region"]
+                    - ""
+        dns:
+          files:
+            /etc/dnsmasq.conf:
+              mode: '000640'
+              owner: root
+              group: root
+              content:
+                'Fn::Join':
+                  - "\n"
+                  - - listen-address=127.0.0.1
+                    - port=53
+                    - bind-interfaces
+                    - pid-file=/var/run/dnsmasq.pid
+                    - ''
+                    - resolv-file=/etc/resolv.conf
+                    - cache-size=500
+                    - neg-ttl=60
+                    - domain-needed
+                    - bogus-priv
+                    - server=/amazonaws.com/169.254.169.253
+          commands:
+            01_yum_install:
+              command: yum install -y dnsmasq bind-utils
+            02_dnsmasq_service:
+              command: pidof systemd && systemctl restart dnsmasq.service
+            03_dnsmasq_service_perm:
+              command: pidof systemd && systemctl enable  dnsmasq.service
+            04_dnsmasq_dhcp_client:
+              command: bash -c "echo 'supersede domain-name-servers 127.0.0.1, 172.17.0.220, 172.17.1.150, 172.17.2.91;' >> /etc/dhcp/dhclient.conf"
+            05_restart_dhcp_client:
+              command: bash -c "dhclient"
+        domain:
+          commands:
+            01_join_domain:
+              command: curl -s http://aws-core-linux-repo.corp.hpicloud.net/utils/userdata.sh | /bin/sh --verbose /dev/stdin $AwsAccountName  Application Bastion AUTH\\AWS-$AwsAccountNumber-OPERATOR AUTH\\AWS-$AwsAccountNumber-DEVELOPER AUTH\\AWS-$AwsAccountNumber-ADMIN >> /var/log/domain-userdata.log
+              env: 
+                AwsAccountName: !Ref AwsAccountName
+                AwsAccountNumber: !Ref AwsAccountNumber
+  ###############################################
+  # EKS Components
+  ###############################################
+
+  ControlPlane:
+    Type: 'AWS::EKS::Cluster'
+    Properties:
+      Name: !Ref EKSClusterName
+      ResourcesVpcConfig:
+        SecurityGroupIds:
+          - !Ref ControlPlaneSecurityGroup
+        SubnetIds:
+          - !Ref SubnetAz1ID
+          - !Ref SubnetAz2ID
+          - !Ref SubnetAz3ID
+      RoleArn: !GetAtt
+        - ServiceRole
+        - Arn
+      Version: !Ref EKSVersion
+  ControlPlaneSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Communication between the control plane and worker nodegroups
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}/ControlPlaneSecurityGroup'
+      VpcId: !Ref 'VPC'
+
+
+  IngressFromBastion:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      Description: Allow access to control plane from bastion
+      FromPort: 0
+      GroupId: !GetAtt
+        - ControlPlane
+        - ClusterSecurityGroupId
+      IpProtocol: '-1'
+      SourceSecurityGroupId: !Ref 'BastionSecurityGroup'
+      ToPort: 65535
+  PolicyCloudWatchMetrics:
+    Type: 'AWS::IAM::Policy'
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Action:
+              - 'cloudwatch:PutMetricData'
+            Effect: Allow
+            Resource: '*'
+        Version: 2012-10-17
+      PolicyName: !Sub '${AWS::StackName}-PolicyCloudWatchMetrics'
+      Roles:
+        - !Ref ServiceRole
+  PolicyELBPermissions:
+    Type: 'AWS::IAM::Policy'
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Action:
+              - 'ec2:DescribeAccountAttributes'
+              - 'ec2:DescribeAddresses'
+              - 'ec2:DescribeInternetGateways'
+            Effect: Allow
+            Resource: '*'
+        Version: 2012-10-17
+      PolicyName: !Sub '${AWS::StackName}-PolicyELBPermissions'
+      Roles:
+        - !Ref ServiceRole
+  ServiceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service:
+                - !FindInMap
+                  - ServicePrincipalPartitionMap
+                  - !Ref 'AWS::Partition'
+                  - EKS
+        Version: 2012-10-17
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonEKSClusterPolicy'
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonEKSVPCResourceController'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}/ServiceRole'
+
+
+  StellarSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Ref StellarSecurityGroupName
+      GroupDescription: Security group for Stellar components
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: "-1"
+          CidrIp: !Ref 'VPCCidr'
+
+  StellarSecurityGroupIngressFromSelf:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Ingress from Bastion
+      GroupId: !Ref 'StellarSecurityGroup'
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref 'StellarSecurityGroup'
+
+  AWSServiceRoleForAmazonElasticsearchService:
+    Type: 'AWS::IAM::ServiceLinkedRole'
+    Properties:
+      AWSServiceName: es.amazonaws.com
+      Description: 'Role for ES to access resources in VPC'
+
+  ###############################################
+  # Ansible Vault password
+  ###############################################
+  AnsibleSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: 'Ansible Vault password'
+      Name: !Sub "${AWS::StackName}-ansible-vault"
+      GenerateSecretString:
+        SecretStringTemplate: '{"ansible": "vault"}'
+        GenerateStringKey: 'password'
+        PasswordLength: 16
+        ExcludeCharacters: "=:,\"'`@/\\$#%&"
+
+Outputs:
+  ARN:
+    Value: !GetAtt
+      - ControlPlane
+      - Arn
+    Export:
+      Name: !Sub '${AWS::StackName}::ARN'
+  CertificateAuthorityData:
+    Value: !GetAtt
+      - ControlPlane
+      - CertificateAuthorityData
+  ClusterSecurityGroupId:
+    Value: !GetAtt
+      - ControlPlane
+      - ClusterSecurityGroupId
+    Export:
+      Name: !Sub '${AWS::StackName}::ClusterSecurityGroupId'
+  ClusterStackName:
+    Value: !Ref 'AWS::StackName'
+  Endpoint:
+    Value: !GetAtt
+      - ControlPlane
+      - Endpoint
+    Export:
+      Name: !Sub '${AWS::StackName}::Endpoint'
+  
+  FeatureNATMode:
+    Value: Disable
+  SecurityGroup:
+    Value: !Ref ControlPlaneSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}::SecurityGroup'
+  ServiceRoleARN:
+    Value: !GetAtt
+      - ServiceRole
+      - Arn
+    Export:
+      Name: !Sub '${AWS::StackName}::ServiceRoleARN'
+
+  VPC:
+    Value: !Ref 'VPC'
+    Export:
+      Name: !Sub '${AWS::StackName}::VPC'
